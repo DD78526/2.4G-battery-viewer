@@ -3,7 +3,8 @@
 
 界面约定
 --------
-* 通知区域两个图标：ATK 鼠标（纯数字）、DARKRIM 耳机（数字带深色底板）。
+* 通知区域最多三个图标：小米鼠标（纯数字）、雷蛇耳机 / 赛睿耳机（数字带深色底板）。
+  没插接收器的那一类不显示图标（三类都没插时全部显示 "--"，免得托盘里什么都看不到）。
   图标颜色随电量变化：绿 ≥60 / 黄 30-59 / 红 <30。
 * **右键图标 → 直接打开简洁界面**（界面里改设置：刷新间隔 / 开机自启 / 退出托盘）。
 * 左键图标 → 立刻刷新一次。
@@ -37,8 +38,7 @@ from ctypes import wintypes
 from typing import Optional
 
 import hid_win as hw
-import battery as bt
-import darkrim_proto as drp
+import devices
 import win_icon
 import tray_common as tc
 
@@ -156,39 +156,25 @@ KERNEL32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
 
 TRAY_ICONS = [
     # (uID, key, 提示名, 是否带底板)
-    (1, "mouse", "ATK 鼠标", False),
-    (2, "headset", "DARKRIM 耳机", True),
+    (1, "xiaomi", "小米鼠标", False),
+    (2, "razer", "雷蛇耳机", True),
+    (3, "steelseries", "赛睿耳机", True),
 ]
 
 
 # --------------------------------------------------------------------------
-# 设备读取（轻量版）
+# 设备读取：devices.py（面板和托盘共用）
 # --------------------------------------------------------------------------
-def _find_iface(vid: int, usage_page: int, output_len: int = 0):
-    for d in hw.enumerate_hid():
-        if d.vid == vid and d.usage_page == usage_page:
-            if not output_len or d.output_len == output_len:
-                return d
-    return None
-
-
-def read_mouse() -> tuple[Optional[int], str]:
-    iface = _find_iface(0x373B, 0xFF05, 64) or _find_iface(0x373B, 0xFF02)
-    if iface is None:
-        return None, "没找到接收器"
-    try:
-        res = bt.strategy_vendor_protocol(iface)
-    except Exception as e:
-        return None, f"读取失败：{e}"
-    if res is None:
-        return None, "没有可用的读取方式"
-    if res.ok:
-        return res.level, ""
-    return None, res.detail or "无回复（动一下鼠标）"
-
-
-def read_headset() -> tuple[Optional[int], str]:
-    return drp.read_battery_only(timeout=0.4)
+def read_levels() -> dict[str, tuple[Optional[int], str, bool]]:
+    """-> {key: (电量或 None, 说明, 是否找到接收器)}"""
+    out = {}
+    for key, r in devices.read_all_dict().items():
+        if r.ok:
+            note = ("约" if r.approx else "") + (f"，{r.status}" if r.status == "充电中" else "")
+            out[key] = (r.level, note, True)
+        else:
+            out[key] = (None, r.error or r.status or "未知", r.found)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -201,8 +187,9 @@ class TrayApp:
         self.hwnd: Optional[int] = None
         self.wndproc_ref = None
         self.busy = False
-        self.levels = {k: (None, "正在读取…") for _, k, _, _ in TRAY_ICONS}
+        self.levels = {k: (None, "正在读取…", True) for _, k, _, _ in TRAY_ICONS}
         self.icons_added = False
+        self.shown: set[int] = set()
         self.taskbar_created_msg = USER32.RegisterWindowMessageW("TaskbarCreated")
         self.msg_quit = USER32.RegisterWindowMessageW(tc.MSG_QUIT)
         self.msg_reload = USER32.RegisterWindowMessageW(tc.MSG_RELOAD)
@@ -240,32 +227,55 @@ class TrayApp:
 
     def _apply_icon(self, action: int, uID: int, key: str, title: str,
                     plate: bool) -> bool:
-        level, err = self.levels[key]
+        level, note, _found = self.levels[key]
         text = str(level) if level is not None else "--"
         nid = self._nid(uID)
         nid.hIcon = win_icon.make_hicon(text, self._color(level), plate)
-        nid.szTip = (f"{title}：{level}%（{time.strftime('%H:%M:%S')} 更新）"
-                     if level is not None else f"{title}：{err or '未知'}")
+        if level is not None:
+            tip = f"{title}：{'约 ' if note.startswith('约') else ''}{level}%" \
+                  f"{'（充电中）' if '充电中' in note else ''}（{time.strftime('%H:%M:%S')} 更新）"
+        else:
+            tip = f"{title}：{note or '未知'}"
+        nid.szTip = tip[:127]                 # szTip 最多 128 个宽字符（含结尾 0）
         return bool(SHELL32.Shell_NotifyIconW(action, ctypes.byref(nid)))
 
+    def _visible(self) -> list:
+        """要显示的图标：找到接收器的那几类；一个都没找到时全部显示。"""
+        vis = [t for t in TRAY_ICONS if self.levels[t[1]][2]]
+        return vis or list(TRAY_ICONS)
+
     def add_icons(self) -> None:
-        for uID, key, title, plate in TRAY_ICONS:
+        self.shown = set()
+        for uID, key, title, plate in self._visible():
             ok = self._apply_icon(NIM_ADD, uID, key, title, plate)
+            if ok:
+                self.shown.add(uID)
             self.log(f"NIM_ADD {title} -> {'ok' if ok else '失败'}")
         self.icons_added = True
+
+    def _delete_icon(self, uID: int) -> None:
+        nid = self._nid(uID)
+        nid.uFlags = 0
+        SHELL32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+        self.shown.discard(uID)
 
     def update_icons(self) -> None:
         if not self.icons_added:
             self.add_icons()
             return
-        for uID, key, title, plate in TRAY_ICONS:
-            self._apply_icon(NIM_MODIFY, uID, key, title, plate)
+        visible = self._visible()
+        want = {t[0] for t in visible}
+        for uID in list(self.shown - want):
+            self._delete_icon(uID)
+        for uID, key, title, plate in visible:
+            if uID in self.shown:
+                self._apply_icon(NIM_MODIFY, uID, key, title, plate)
+            elif self._apply_icon(NIM_ADD, uID, key, title, plate):
+                self.shown.add(uID)
 
     def remove_icons(self) -> None:
         for uID, _, _, _ in TRAY_ICONS:
-            nid = self._nid(uID)
-            nid.uFlags = 0
-            SHELL32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+            self._delete_icon(uID)
         self.icons_added = False
 
     # ---- 定时器 / 刷新 --------------------------------------------------
@@ -303,16 +313,16 @@ class TrayApp:
 
     def _worker(self, hwnd: int) -> None:
         try:
-            self.levels["mouse"] = read_mouse()
-            self.levels["headset"] = read_headset()
+            self.levels.update(read_levels())
         except Exception:
             self.log("读取异常:\n" + traceback.format_exc())
         USER32.PostMessageW(hwnd, MSG_REFRESH_DONE, 0, 0)
 
     def on_refresh_done(self) -> None:
         self.busy = False
-        m, h = self.levels["mouse"], self.levels["headset"]
-        self.log(f"刷新完成：鼠标={m[0]}（{m[1] or 'ok'}） 耳机={h[0]}（{h[1] or 'ok'}）")
+        self.log("刷新完成：" + "  ".join(
+            f"{title}={self.levels[key][0]}（{self.levels[key][1] or 'ok'}）"
+            for _, key, title, _ in TRAY_ICONS))
         self.update_icons()
 
     # ---- 打开简洁界面 ---------------------------------------------------
