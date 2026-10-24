@@ -4,7 +4,7 @@
 协议来源（真机 + 官方 DLL 反汇编，不是猜的）：
   [DLL]  XiaoMiMouseLibrary.dll（随「小米键鼠」/ Xiaomi G-HUB 安装，PE32）
          导出 XIAOMIMOUSE_GetBatteryLevel；电池辅助函数约 0x1000a110
-         Feature 请求 opcode 字 0x8103（小端写到 [3],[4]，见 build_battery_request）
+         Feature 请求 opcode 字 0x8103（大端写到 [3]=81 [4]=03，见 build_battery_request）
          product_type==2 时 byte[5]=0x02（Mouse X1 / 50A5·50A6 实测）
          校验：sum(bytes[0..62]) → [63]=lo [64]=hi（DLL 约 0x10002030）
          成功：回复 [1]==0x01，电量在 [9]（0..100）
@@ -34,7 +34,7 @@ VID = 0x2717
 VENDOR_USAGE_PAGE = 0xFFFF
 VENDOR_USAGE = 0x0001
 VENDOR_FEATURE_LEN = 65
-VENDOR_OPCODE = 0x8103          # LE 落在请求 [3]=0x03 [4]=0x81
+VENDOR_OPCODE = 0x8103          # BE 落在请求 [3]=0x81 [4]=0x03
 VENDOR_SETTLE_S = 0.08
 
 KNOWN_MODELS = {
@@ -98,16 +98,16 @@ def checksum65(buf: bytearray) -> None:
 def build_battery_request(product_type: int = 2, param: int = 0) -> bytes:
     """构造 65 字节 GetBatteryLevel Feature 请求。
 
-    布局（与 DLL / 真机一致）：
+    布局（与 DLL / 真机确认脚本一致）：
       [0]=00 report id  [1]=00  [2]=03
-      [3]=03 [4]=81     ← opcode 0x8103 的字节序（先低后高写到 [3],[4]）
+      [3]=81 [4]=03     ← opcode 0x8103 大端写到 [3],[4]（真机帧 00 00 03 81 03 02 …）
       [5]=product_type  [6]=00  [7]=param  [8]=01
       [9..62]=00        [63..64]=checksum
     """
     b = bytearray(VENDOR_FEATURE_LEN)
     b[2] = 0x03
-    b[3] = VENDOR_OPCODE & 0xFF          # 0x03
-    b[4] = (VENDOR_OPCODE >> 8) & 0xFF   # 0x81
+    b[3] = (VENDOR_OPCODE >> 8) & 0xFF   # 0x81
+    b[4] = VENDOR_OPCODE & 0xFF          # 0x03
     b[5] = product_type & 0xFF
     b[7] = param & 0xFF
     b[8] = 0x01

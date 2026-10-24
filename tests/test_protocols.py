@@ -387,7 +387,7 @@ class TestXiaomi(Base):
     def test_checksum65_and_request_layout(self):
         req = xm.build_battery_request(product_type=2, param=0)
         self.assertEqual(len(req), 65)
-        self.assertEqual(list(req[:9]), [0x00, 0x00, 0x03, 0x03, 0x81, 0x02, 0x00, 0x00, 0x01])
+        self.assertEqual(list(req[:9]), [0x00, 0x00, 0x03, 0x81, 0x03, 0x02, 0x00, 0x00, 0x01])
         s = sum(req[0:63]) & 0xFFFF
         self.assertEqual(req[63], s & 0xFF)
         self.assertEqual(req[64], (s >> 8) & 0xFF)
@@ -408,7 +408,7 @@ class TestXiaomi(Base):
                           0xFFFF, 0x0001, feature_len=65)
 
         def responder(frame: bytes) -> bytes:
-            self.assertEqual(frame[3:6], bytes([0x03, 0x81, 0x02]))
+            self.assertEqual(frame[3:6], bytes([0x81, 0x03, 0x02]))
             out = bytearray(65)
             out[0:9] = bytes([0x00, 0x01, 0x03, 0x81, 0x03, 0x02, 0x00, 0x00, 0x01])
             out[9] = 73
