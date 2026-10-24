@@ -34,6 +34,7 @@ jobs:
           --name BatteryViewer
           --hidden-import=devices
           --hidden-import=tray_common
+          --hidden-import=tray_prefs
           --hidden-import=win_link
           --hidden-import=win_shell
           --hidden-import=win_icon
@@ -60,6 +61,7 @@ jobs:
           --name BatteryTray
           --hidden-import=devices
           --hidden-import=tray_common
+          --hidden-import=tray_prefs
           --hidden-import=win_link
           --hidden-import=win_shell
           --hidden-import=win_icon

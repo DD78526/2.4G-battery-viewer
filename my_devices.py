@@ -22,6 +22,7 @@ from typing import Optional
 
 import devices
 import tray_common as tc
+import tray_prefs as prefs
 import win_link
 
 
@@ -195,6 +196,34 @@ def build_ui():
     ttk.Checkbutton(head, text="自动刷新", variable=v_auto,
                     command=on_auto).pack(side="right", padx=(0, 12))
 
+    v_tray_pct = tk.BooleanVar(value=bool(cfg.get("tray_show_percent", True)))
+
+    def on_tray_pct():
+        want = bool(v_tray_pct.get())
+        cfg["tray_show_percent"] = want
+        tc.save_config(cfg)
+        tc.post_to_tray(tc.MSG_RELOAD)
+        if want and not tc.is_tray_running():
+            # 勾选后若托盘未运行，后台拉起，否则看不到百分比图标
+            state["starting"] = True
+            state["started_at"] = time.time()
+            btn_tray.configure(state="disabled", text="正在启动…")
+            lab_tray.configure(text="正在启动托盘程序…")
+
+            def work():
+                try:
+                    ok = tc.start_tray_app()
+                except Exception:
+                    traceback.print_exc()
+                    ok = False
+                results.put(("tray", ok))
+
+            threading.Thread(target=work, daemon=True).start()
+        notify("托盘将显示电量百分比" if want else "托盘恢复为仅图标（不显示百分比）")
+
+    ttk.Checkbutton(head, text="在系统托盘显示电量百分比", variable=v_tray_pct,
+                    command=on_tray_pct).pack(side="right", padx=(0, 12))
+
     # ---- 卡片 ----
     body = ttk.Frame(root, padding=(18, 4, 18, 4))
     body.pack(fill="both", expand=True)
@@ -334,6 +363,50 @@ def build_ui():
     ttk.Checkbutton(row_a, text="开机自启（任务管理器可见）", variable=v_boot,
                     command=on_boot).pack(side="left", padx=(18, 0))
 
+    v_start_min = tk.BooleanVar(value=bool(cfg.get("start_minimized", False)))
+
+    def on_start_min():
+        cfg["start_minimized"] = bool(v_start_min.get())
+        tc.save_config(cfg)
+        tc.post_to_tray(tc.MSG_RELOAD)
+        if v_start_min.get():
+            notify("已开启：启动时直接最小化到托盘（需托盘在运行）", 10)
+        else:
+            notify("已关闭：启动时显示主界面")
+
+    ttk.Checkbutton(row_a, text="开机自启直接最小化", variable=v_start_min,
+                    command=on_start_min).pack(side="left", padx=(18, 0))
+
+    v_close_tray = tk.BooleanVar(value=bool(cfg.get("close_to_tray", False)))
+
+    def on_close_to_tray():
+        want = bool(v_close_tray.get())
+        cfg["close_to_tray"] = want
+        tc.save_config(cfg)
+        tc.post_to_tray(tc.MSG_RELOAD)
+        if want:
+            if not tc.is_tray_running():
+                state["starting"] = True
+                state["started_at"] = time.time()
+                btn_tray.configure(state="disabled", text="正在启动…")
+                lab_tray.configure(text="正在启动托盘程序…")
+
+                def work():
+                    try:
+                        ok = tc.start_tray_app()
+                    except Exception:
+                        traceback.print_exc()
+                        ok = False
+                    results.put(("tray", ok))
+
+                threading.Thread(target=work, daemon=True).start()
+            notify("关闭窗口将最小化到托盘；请在托盘右键菜单选「退出」真正退出", 12)
+        else:
+            notify("关闭窗口将退出程序")
+
+    ttk.Checkbutton(row_a, text="关闭ui=最小化到系统托盘", variable=v_close_tray,
+                    command=on_close_to_tray).pack(side="left", padx=(18, 0))
+
     btn_tray = ttk.Button(row_b, text="退出托盘程序", command=on_tray_toggle)
     btn_tray.pack(side="right")
     btn_link = ttk.Button(row_b, text="重建桌面链接", command=on_links)
@@ -421,6 +494,30 @@ def build_ui():
         except Exception:
             pass
     root.after(250, raise_me)
+
+    def on_close():
+        """关闭按钮：可选藏到托盘，而不是退出。"""
+        if bool(v_close_tray.get()):
+            if not tc.is_tray_running():
+                try:
+                    tc.start_tray_app()
+                except Exception:
+                    traceback.print_exc()
+            try:
+                root.withdraw()
+            except Exception:
+                pass
+            notify("已最小化到托盘（右键托盘图标 → 退出 可真正退出）", 10)
+            return
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    # 供 main() 启动时决定是否 withdraw
+    root._battery_start_minimized = bool(cfg.get("start_minimized", False))  # type: ignore[attr-defined]
+    root._battery_ensure_tray = tc.start_tray_app  # type: ignore[attr-defined]
     return root
 
 
@@ -433,6 +530,8 @@ def main() -> None:
                         help="在桌面重建软连接（项目文件夹 + 启动脚本）")
     parser.add_argument("--autostart", choices=["on", "off", "status"],
                         help="开机自启：on 打开 / off 关闭 / status 查看")
+    parser.add_argument("--minimized", action="store_true",
+                        help="启动时直接最小化到托盘（不显示主窗口）")
     args = parser.parse_args()
 
     if args.install_links:
@@ -472,6 +571,15 @@ def main() -> None:
         traceback.print_exc()
         cli_once()
         return
+
+    cfg = tc.load_config()
+    if prefs.should_start_minimized(cfg, argv_minimized=bool(args.minimized)):
+        try:
+            if not tc.is_tray_running():
+                tc.start_tray_app()
+            root.withdraw()
+        except Exception:
+            traceback.print_exc()
     root.mainloop()
 
 

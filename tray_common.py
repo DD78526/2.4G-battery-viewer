@@ -16,6 +16,7 @@ from typing import Optional
 
 import win_link
 import win_shell
+import tray_prefs as prefs
 
 def is_frozen() -> bool:
     """PyInstaller / 打包后的 EXE 运行时为 True。"""
@@ -45,10 +46,7 @@ MUTEX_NAME = "Global\\DeviceBatteryTray_single_instance"
 # 界面标题（托盘用它来找到已打开的窗口）
 UI_TITLE = "我的设备电量"
 
-DEFAULT_CONFIG = {
-    "interval": 60,        # 托盘轮询间隔（秒）
-    "autostart": True,     # 开机自启
-}
+DEFAULT_CONFIG = dict(prefs.DEFAULT_CONFIG)
 
 INTERVAL_CHOICES = [(30, "30 秒"), (60, "1 分钟"), (120, "2 分钟"),
                     (300, "5 分钟"), (600, "10 分钟"), (1800, "30 分钟")]

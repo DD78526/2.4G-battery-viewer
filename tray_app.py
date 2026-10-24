@@ -6,9 +6,11 @@
 * 通知区域最多三个图标：小米鼠标（纯数字）、雷蛇耳机 / 赛睿耳机（数字带深色底板）。
   没插接收器的那一类不显示图标（三类都没插时全部显示 "--"，免得托盘里什么都看不到）。
   图标颜色随电量变化：绿 ≥60 / 黄 30-59 / 红 <30。
-* **右键图标 → 直接打开简洁界面**（界面里改设置：刷新间隔 / 开机自启 / 退出托盘）。
-* 左键图标 → 立刻刷新一次。
-* 悬停显示 tooltip：设备名 + 电量 + 更新时间。
+* **右键图标 → 菜单**（打开界面 / 立即刷新 / 退出）。
+* **双击图标 → 打开/恢复简洁界面**。
+* 左键单击 → 立刻刷新一次。
+* 悬停 tooltip：开启「托盘显示电量%」时以设备名为主（可带电量）。
+* 「托盘显示电量%」关闭时恢复仅图标（色块）外观。
 
 其它
 ----
@@ -41,6 +43,7 @@ import hid_win as hw
 import devices
 import win_icon
 import tray_common as tc
+import tray_prefs as prefs
 
 BASE_DIR = tc.BASE_DIR
 APP_NAME = tc.APP_NAME
@@ -57,9 +60,22 @@ WM_NULL = 0x0000
 WM_LBUTTONUP = 0x0202
 WM_LBUTTONDBLCLK = 0x0203
 WM_RBUTTONUP = 0x0205
+WM_COMMAND = 0x0111
+WM_QUIT = 0x0012
+WM_CLOSE = 0x0010
 WM_APP = 0x8000
 MSG_TRAY_CALLBACK = WM_APP + 1
 MSG_REFRESH_DONE = WM_APP + 2
+
+# 托盘右键菜单命令
+IDM_OPEN = 1001
+IDM_REFRESH = 1002
+IDM_QUIT = 1003
+
+MF_STRING = 0x0000
+MF_SEPARATOR = 0x0800
+TPM_RIGHTBUTTON = 0x0002
+TPM_RETURNCMD = 0x0100
 
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
@@ -117,6 +133,10 @@ class MSG(ctypes.Structure):
                 ("pt_y", wintypes.LONG)]
 
 
+class POINT(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
 USER32.RegisterClassExW.restype = wintypes.WORD
 USER32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
 USER32.CreateWindowExW.restype = ctypes.c_void_p
@@ -143,6 +163,19 @@ USER32.TranslateMessage.restype = wintypes.BOOL
 USER32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
 USER32.DispatchMessageW.restype = ctypes.c_ssize_t
 USER32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
+USER32.CreatePopupMenu.restype = ctypes.c_void_p
+USER32.CreatePopupMenu.argtypes = []
+USER32.AppendMenuW.restype = wintypes.BOOL
+USER32.AppendMenuW.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_size_t,
+                               wintypes.LPCWSTR]
+USER32.TrackPopupMenu.restype = ctypes.c_int
+USER32.TrackPopupMenu.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                                  ctypes.c_void_p]
+USER32.DestroyMenu.restype = wintypes.BOOL
+USER32.DestroyMenu.argtypes = [ctypes.c_void_p]
+USER32.GetCursorPos.restype = wintypes.BOOL
+USER32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
 
 SHELL32.Shell_NotifyIconW.restype = wintypes.BOOL
 SHELL32.Shell_NotifyIconW.argtypes = [wintypes.DWORD,
@@ -225,24 +258,27 @@ class TrayApp:
         nid.uCallbackMessage = MSG_TRAY_CALLBACK
         return nid
 
+    def _show_percent(self) -> bool:
+        return bool(self.cfg.get("tray_show_percent", True))
+
     def _apply_icon(self, action: int, uID: int, key: str, title: str,
                     plate: bool) -> bool:
         level, note, _found = self.levels[key]
-        text = str(level) if level is not None else "--"
+        show_pct = self._show_percent()
+        label = prefs.icon_text(level, show_pct)
+        # 仅图标模式统一带底板，方便辨认色块
+        use_plate = plate or (not show_pct)
         nid = self._nid(uID)
-        nid.hIcon = win_icon.make_hicon(text, self._color(level), plate)
-        if level is not None:
-            tip = f"{title}：{'约 ' if note.startswith('约') else ''}{level}%" \
-                  f"{'（充电中）' if '充电中' in note else ''}（{time.strftime('%H:%M:%S')} 更新）"
-        else:
-            tip = f"{title}：{note or '未知'}"
+        nid.hIcon = win_icon.make_hicon(label, self._color(level), use_plate)
+        tip = prefs.icon_tooltip(title, level, note, show_pct)
+        if show_pct and level is not None:
+            tip = f"{tip}（{time.strftime('%H:%M:%S')}）"
         nid.szTip = tip[:127]                 # szTip 最多 128 个宽字符（含结尾 0）
         return bool(SHELL32.Shell_NotifyIconW(action, ctypes.byref(nid)))
 
     def _visible(self) -> list:
-        """要显示的图标：找到接收器的那几类；一个都没找到时全部显示。"""
-        vis = [t for t in TRAY_ICONS if self.levels[t[1]][2]]
-        return vis or list(TRAY_ICONS)
+        """只显示当前检测到接收器的设备；一个都没有则不占托盘。"""
+        return prefs.visible_icon_entries(TRAY_ICONS, self.levels)
 
     def add_icons(self) -> None:
         self.shown = set()
@@ -292,11 +328,16 @@ class TrayApp:
         （早先的版本会自动"纠正"，结果一次读到不一致就把用户的启动项删了。）
         """
         new = tc.load_config()
-        changed = new["interval"] != self.cfg["interval"]
+        interval_changed = new["interval"] != self.cfg["interval"]
+        percent_changed = bool(new.get("tray_show_percent")) != bool(
+            self.cfg.get("tray_show_percent"))
         self.cfg = new
-        if changed:
+        if interval_changed:
             self.log(f"刷新间隔 -> {new['interval']} 秒")
             self.apply_timer()
+        if percent_changed:
+            self.log(f"托盘显示电量% -> {bool(new.get('tray_show_percent'))}")
+            self.update_icons()
 
         actual = tc.is_autostart_enabled()
         if bool(self.cfg.get("autostart")) != actual:
@@ -326,12 +367,15 @@ class TrayApp:
         self.update_icons()
 
     # ---- 打开简洁界面 ---------------------------------------------------
-    def open_ui(self) -> None:
+    def open_ui(self, minimized: bool = False) -> None:
         hwnd = tc.ui_hwnd()
         if hwnd:
-            USER32.ShowWindow(hwnd, SW_RESTORE)
-            USER32.SetForegroundWindow(hwnd)
-            self.log("简洁界面已在前台")
+            if minimized:
+                USER32.ShowWindow(hwnd, 0)          # SW_HIDE
+            else:
+                USER32.ShowWindow(hwnd, SW_RESTORE)
+                USER32.SetForegroundWindow(hwnd)
+            self.log("简洁界面已在前台" if not minimized else "简洁界面保持隐藏")
             return
         import subprocess
         try:
@@ -339,10 +383,53 @@ class TrayApp:
                 cmd = [tc.panel_target()]
             else:
                 cmd = [tc.pythonw_path(), tc.panel_target()]
+            if minimized:
+                cmd = list(cmd) + ["--minimized"]
             subprocess.Popen(cmd, cwd=BASE_DIR, creationflags=0x00000008)
-            self.log("已打开简洁界面")
+            self.log("已打开简洁界面" + ("（最小化）" if minimized else ""))
         except Exception as e:
             self.log(f"打开界面失败：{e}")
+
+    def show_menu(self) -> None:
+        """右键菜单：打开界面 / 刷新 / 退出（真正退出，不是藏到托盘）。"""
+        menu = USER32.CreatePopupMenu()
+        if not menu:
+            return
+        try:
+            USER32.AppendMenuW(menu, MF_STRING, IDM_OPEN, "打开界面")
+            USER32.AppendMenuW(menu, MF_STRING, IDM_REFRESH, "立即刷新")
+            USER32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            USER32.AppendMenuW(menu, MF_STRING, IDM_QUIT, "退出")
+            pt = POINT()
+            USER32.GetCursorPos(ctypes.byref(pt))
+            # 让菜单能正确收回：先置前台再 TrackPopupMenu
+            USER32.SetForegroundWindow(self.hwnd)
+            cmd = USER32.TrackPopupMenu(
+                menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                pt.x, pt.y, 0, self.hwnd, None)
+            USER32.PostMessageW(self.hwnd, WM_NULL, 0, 0)
+            if cmd == IDM_OPEN:
+                self.open_ui()
+            elif cmd == IDM_REFRESH:
+                self.refresh_now()
+            elif cmd == IDM_QUIT:
+                self.quit_all()
+        finally:
+            USER32.DestroyMenu(menu)
+
+    def quit_ui(self) -> None:
+        """强制关掉简洁界面（绕过「关闭=最小化到托盘」）。"""
+        hwnd = tc.ui_hwnd()
+        if not hwnd:
+            return
+        # DestroyWindow 不走 Tk 的 WM_DELETE_WINDOW，避免又被藏起来
+        USER32.DestroyWindow(hwnd)
+        self.log("已强制关闭简洁界面")
+
+    def quit_all(self) -> None:
+        """托盘菜单「退出」：界面 + 托盘都真正退出。"""
+        self.quit_ui()
+        self.quit()
 
     def quit(self) -> None:
         self.log("退出")
@@ -361,9 +448,11 @@ class TrayApp:
         if msg == MSG_TRAY_CALLBACK:
             event = int(lparam) & 0xFFFF
             if event == WM_RBUTTONUP:
-                self.open_ui()                     # 右键：直接打开界面
-            elif event in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
-                self.refresh_now()                 # 左键：立刻刷新
+                self.show_menu()                   # 右键：菜单（含真正退出）
+            elif event == WM_LBUTTONDBLCLK:
+                self.open_ui()                     # 双击：打开/恢复界面
+            elif event == WM_LBUTTONUP:
+                self.refresh_now()                 # 左键单击：立刻刷新
             return 0
         if msg == MSG_REFRESH_DONE:
             self.on_refresh_done()
@@ -415,6 +504,9 @@ class TrayApp:
         self.apply_config()
         self.apply_timer()
         self.refresh_now()
+        # 开机自启 / 「开机自启直接最小化」：托盘起来后把面板藏着启动
+        if prefs.should_start_minimized(self.cfg):
+            self.open_ui(minimized=True)
 
         msg = MSG()
         while USER32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -448,7 +540,7 @@ def main() -> int:
         if tc.is_tray_running():
             # 真有一个正常实例在跑：让它重读配置
             tc.post_to_tray(tc.MSG_RELOAD)
-            print("已经在运行了（托盘里两个数字图标就是它；右键图标打开界面）")
+            print("已经在运行了（托盘图标就是它；双击打开界面，右键可退出）")
             return 0
         # 有人占着锁但已经没有窗口 —— 上一版留下的僵尸进程，清掉后继续启动
         tc.cleanup_zombie()
