@@ -1,32 +1,24 @@
 # -*- coding: utf-8 -*-
 """xiaomi_proto.py —— 小米（Xiaomi, VID 0x2717）2.4G 无线鼠标电量读取
 
-现状（实话实说）
-----------------
-查遍了公开资料，**没有找到小米 2.4G 接收器的电量协议**：
-  * Linux 内核 drivers/hid/hid-xiaomi.c 只修正了 Silent Mouse（蓝牙，2717:5014）的侧键描述符，
-    不涉及电量；
-  * libratbag / piper 不支持小米鼠标（libratbag issue #1800：Mouse X1 2717:50A6）；
-  * linux-hardware.org 等硬件库只有 VID/PID 和描述符，没有电量相关的厂商命令。
+协议来源（真机 + 官方 DLL 反汇编，不是猜的）：
+  [DLL]  XiaoMiMouseLibrary.dll（随「小米键鼠」/ Xiaomi G-HUB 安装，PE32）
+         导出 XIAOMIMOUSE_GetBatteryLevel；电池辅助函数约 0x1000a110
+         Feature 请求 opcode 字 0x8103（小端写到 [3],[4]，见 build_battery_request）
+         product_type==2 时 byte[5]=0x02（Mouse X1 / 50A5·50A6 实测）
+         校验：sum(bytes[0..62]) → [63]=lo [64]=hi（DLL 约 0x10002030）
+         成功：回复 [1]==0x01，电量在 [9]（0..100）
+         [1]==0x03 为 NAK/粘滞 echo，不当作电量
+  [LIVE] 本仓库在 Windows 真机 2717:50A5（产品串 XiaoMi Mouse X1，嵌套 50A6）
+         MI_02 / UsagePage 0xFFFF Usage 0x0001 / FeatureReportByteLength=65
+         连续 8 次读到 status=01 level=01（近空电，稳定）
 
-所以这里 **不编造厂商私有字节**，只做有依据的两件事：
+公开资料仍然没有完整协议文档（libratbag #1800、hid-xiaomi.c 都不覆盖电量），
+所以未知型号不会瞎编其它 opcode；只对匹配的 65 字节 vendor Feature 口发 0x8103。
 
-1. 标准 HID 电量字段（USB HID Usage Tables）：
-     Generic Device Controls 0x06 / Battery Strength 0x20
-     Battery System 0x85 / Absolute(0x01) / Relative(0x66) State of Charge、Battery Level(0x65)
-   接收器如果在报告描述符里声明了这些字段，就直接读 Feature Report，
-   或者在非系统独占的集合上监听 Input Report 里的这个字段。
-   （故意不用 0x06/0x29 RF Signal Strength —— 那是信号强度，不是电量。）
-
-2. 用户自己标定的协议（protocols_user.json，在 app.py 里“手动标定”生成，VID=2717）。
-   如果你抓到了自己这款鼠标的电量报文，标定一次以后这里就能读。
-
-已知的小米 VID 0x2717 2.4G 设备（来源：linux-hardware.org / usb.ids / libratbag #1800）：
-    5091 / 5094  Mi USB Receiver（小米无线鼠标 / 便携鼠标的接收器）
-    500B         Mi Gaming Mouse 接收器（Telink 方案）
-    5013 / 5017  Mi Wireless Mouse
-    50A6         Mouse X1
-都不保证声明了标准电量字段；读不到时界面会明确提示“该型号未公开电量协议”。
+仍保留两条有依据的兜底：
+  1. 标准 HID 电量字段（Usage 0x06/0x20、0x85/0x01|0x66|0x65）——不用 0x06/0x29 信号强度
+  2. 用户标定协议 protocols_user.json（app.py「手动标定」）
 """
 
 from __future__ import annotations
@@ -34,9 +26,16 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from hid_common import DeviceBattery
+from hid_common import DeviceBattery, interface_number
 
 VID = 0x2717
+
+# Vendor Feature 通道：MI_02 / FFFF:0001 / 65 字节（X1 接收器实测）
+VENDOR_USAGE_PAGE = 0xFFFF
+VENDOR_USAGE = 0x0001
+VENDOR_FEATURE_LEN = 65
+VENDOR_OPCODE = 0x8103          # LE 落在请求 [3]=0x03 [4]=0x81
+VENDOR_SETTLE_S = 0.08
 
 KNOWN_MODELS = {
     0x5091: "小米 USB 接收器（Mi USB Receiver）",
@@ -44,7 +43,14 @@ KNOWN_MODELS = {
     0x500B: "小米游戏鼠标接收器",
     0x5013: "小米无线鼠标",
     0x5017: "小米无线鼠标",
+    0x50A5: "小米鼠标 X1",
     0x50A6: "小米鼠标 X1",
+}
+
+# DLL Open 解析出的 product_type；X1（50A5/50A6）实测必须为 2 才返回 status=01
+PRODUCT_TYPE = {
+    0x50A5: 2,
+    0x50A6: 2,
 }
 
 # (UsagePage, Usage, 说明) —— 只要真正的电量字段
@@ -76,6 +82,105 @@ def match_usage(cap) -> Optional[str]:
     for page, usage, name in BATTERY_USAGES:
         if key == (page, usage):
             return name
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 官方 DLL 反汇编得到的 0x8103 Feature 协议（纯函数，方便单测）
+# ---------------------------------------------------------------------------
+def checksum65(buf: bytearray) -> None:
+    """原地写入 [63]=sum(lo) [64]=sum(hi)；与 XiaoMiMouseLibrary.dll 一致。"""
+    s = sum(buf[0:63]) & 0xFFFF
+    buf[63] = s & 0xFF
+    buf[64] = (s >> 8) & 0xFF
+
+
+def build_battery_request(product_type: int = 2, param: int = 0) -> bytes:
+    """构造 65 字节 GetBatteryLevel Feature 请求。
+
+    布局（与 DLL / 真机一致）：
+      [0]=00 report id  [1]=00  [2]=03
+      [3]=03 [4]=81     ← opcode 0x8103 的字节序（先低后高写到 [3],[4]）
+      [5]=product_type  [6]=00  [7]=param  [8]=01
+      [9..62]=00        [63..64]=checksum
+    """
+    b = bytearray(VENDOR_FEATURE_LEN)
+    b[2] = 0x03
+    b[3] = VENDOR_OPCODE & 0xFF          # 0x03
+    b[4] = (VENDOR_OPCODE >> 8) & 0xFF   # 0x81
+    b[5] = product_type & 0xFF
+    b[7] = param & 0xFF
+    b[8] = 0x01
+    checksum65(b)
+    return bytes(b)
+
+
+def parse_battery_response(resp: bytes) -> Optional[int]:
+    """成功返回 0..100；status!=0x01 或长度不够返回 None。"""
+    if not resp or len(resp) < 10:
+        return None
+    if resp[1] != 0x01:
+        return None
+    return max(0, min(100, int(resp[9])))
+
+
+def product_types_for(pid: int) -> list[int]:
+    """先试该 PID 已知的 product_type，再兜底 2/0/1（去重保序）。"""
+    ordered = []
+    if pid in PRODUCT_TYPE:
+        ordered.append(PRODUCT_TYPE[pid])
+    for t in (2, 0, 1):
+        if t not in ordered:
+            ordered.append(t)
+    return ordered
+
+
+def _is_vendor_iface(iface) -> bool:
+    if (iface.feature_len or 0) < VENDOR_FEATURE_LEN:
+        return False
+    if iface.usage_page == VENDOR_USAGE_PAGE and iface.usage == VENDOR_USAGE:
+        return True
+    # 路径兜底：MI_02（X1 接收器电量口）
+    return interface_number(getattr(iface, "path", "") or "") == 2
+
+
+def _vendor_battery(iface, diag: list, product_types: list[int]) -> Optional[DeviceBattery]:
+    """在 MI_02 65 字节 Feature 口上发 0x8103，读电量。"""
+    if not _is_vendor_iface(iface):
+        return None
+    from hid_win import HidDevice
+
+    last_status = None
+    with HidDevice(iface.path, write=True) as dev:
+        for pt in product_types:
+            req = build_battery_request(product_type=pt, param=0)
+            try:
+                dev.set_feature_report(req)
+            except OSError as e:
+                diag.append(f"  vendor SET pt={pt} 失败：{e}")
+                continue
+            time.sleep(VENDOR_SETTLE_S)
+            try:
+                resp = dev.get_feature_report(0x00, VENDOR_FEATURE_LEN)
+            except OSError as e:
+                diag.append(f"  vendor GET pt={pt} 失败：{e}")
+                continue
+            if not resp:
+                continue
+            last_status = resp[1] if len(resp) > 1 else None
+            level = parse_battery_response(resp)
+            diag.append(
+                f"  vendor 0x8103 pt={pt} status=0x{(last_status or 0):02X} "
+                f"level_byte={resp[9] if len(resp) > 9 else '-'} "
+                f"({'ok' if level is not None else 'nak'})"
+            )
+            if level is not None:
+                return DeviceBattery(
+                    found=True, online=True, level=level, charging=None,
+                    detail=f"小米官方协议 0x8103（product_type={pt}）",
+                )
+    if last_status == 0x03:
+        diag.append("  vendor 口返回 sticky NAK(0x03)，鼠标可能离线或 product_type 不对")
     return None
 
 
@@ -154,6 +259,22 @@ def read_battery(all_ifaces: Optional[list] = None, listen_seconds: float = 1.5)
     pid = sorted({i.pid for i in mine}, key=lambda p: (p not in KNOWN_MODELS, p))[0]
     diag: list = [f"[Xiaomi] {', '.join(sorted({i.vid_pid for i in mine}))}"]
     errors = []
+    pts = product_types_for(pid)
+
+    # 1) 官方 0x8103（优先，X1 真机验证）
+    for iface in mine:
+        try:
+            res = _vendor_battery(iface, diag, pts)
+        except OSError as e:
+            errors.append(str(e))
+            continue
+        if res is not None:
+            res.vid, res.pid = iface.vid, iface.pid
+            res.model = model_name(iface.pid)
+            res.diag = diag
+            return res
+
+    # 2) 标准 HID / 用户标定 / Input 监听
     for step in (_feature_battery, _user_protocol,
                  lambda i, d: _input_battery(i, d, listen_seconds)):
         for iface in mine:
@@ -167,6 +288,7 @@ def read_battery(all_ifaces: Optional[list] = None, listen_seconds: float = 1.5)
                 res.model = model_name(iface.pid)
                 res.diag = diag
                 return res
+
     detail = UNSUPPORTED_HINT
     if errors:
         detail += f"（部分接口打开失败：{errors[0]}）"
@@ -177,4 +299,4 @@ def read_battery(all_ifaces: Optional[list] = None, listen_seconds: float = 1.5)
 if __name__ == "__main__":
     r = read_battery()
     print(r.model, r.level, r.detail)
-    print("\n".join(r.diag))
+    print("\n".join(r.diag or []))

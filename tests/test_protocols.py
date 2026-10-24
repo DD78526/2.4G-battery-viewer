@@ -380,6 +380,69 @@ class TestXiaomi(Base):
         r = xm.read_battery([])
         self.assertFalse(r.found)
 
+    def test_known_models_include_x1(self):
+        self.assertEqual(xm.KNOWN_MODELS[0x50A5], "小米鼠标 X1")
+        self.assertEqual(xm.KNOWN_MODELS[0x50A6], "小米鼠标 X1")
+
+    def test_checksum65_and_request_layout(self):
+        req = xm.build_battery_request(product_type=2, param=0)
+        self.assertEqual(len(req), 65)
+        self.assertEqual(list(req[:9]), [0x00, 0x00, 0x03, 0x03, 0x81, 0x02, 0x00, 0x00, 0x01])
+        s = sum(req[0:63]) & 0xFFFF
+        self.assertEqual(req[63], s & 0xFF)
+        self.assertEqual(req[64], (s >> 8) & 0xFF)
+        # 与真机确认脚本同一帧
+        self.assertEqual(req.hex(), xm.build_battery_request(2, 0).hex())
+
+    def test_parse_battery_response(self):
+        ok = bytes([0x00, 0x01, 0x03, 0x81, 0x03, 0x02, 0x00, 0x00, 0x01, 0x42]) + bytes(55)
+        self.assertEqual(xm.parse_battery_response(ok), 66)
+        nak = bytes([0x00, 0x03, 0x03, 0x81, 0x03, 0x02, 0x00, 0x00, 0x01, 0x42]) + bytes(55)
+        self.assertIsNone(xm.parse_battery_response(nak))
+        self.assertIsNone(xm.parse_battery_response(b""))
+        self.assertEqual(xm.parse_battery_response(
+            bytes([0x00, 0x01]) + bytes(7) + bytes([0xFF]) + bytes(55)), 100)
+
+    def test_vendor_feature_x1_success(self):
+        iface = FakeIface(path(0x2717, 0x50A5, 2), 0x2717, 0x50A5,
+                          0xFFFF, 0x0001, feature_len=65)
+
+        def responder(frame: bytes) -> bytes:
+            self.assertEqual(frame[3:6], bytes([0x03, 0x81, 0x02]))
+            out = bytearray(65)
+            out[0:9] = bytes([0x00, 0x01, 0x03, 0x81, 0x03, 0x02, 0x00, 0x00, 0x01])
+            out[9] = 73
+            return bytes(out)
+
+        FakeDevice.feature_responder = staticmethod(responder)
+        # 单测里不要真 sleep
+        old = xm.VENDOR_SETTLE_S
+        xm.VENDOR_SETTLE_S = 0
+        try:
+            r = xm.read_battery([iface], listen_seconds=0.01)
+        finally:
+            xm.VENDOR_SETTLE_S = old
+        self.assertTrue(r.ok)
+        self.assertEqual(r.level, 73)
+        self.assertEqual(r.model, "小米鼠标 X1")
+        self.assertIn("0x8103", r.detail)
+        self.assertTrue(any("vendor 0x8103" in d for d in r.diag))
+
+    def test_vendor_nak_falls_through(self):
+        iface = FakeIface(path(0x2717, 0x50A5, 2), 0x2717, 0x50A5,
+                          0xFFFF, 0x0001, feature_len=65)
+        FakeDevice.feature_responder = staticmethod(
+            lambda frame: bytes([0x00, 0x03]) + bytes(63))
+        old = xm.VENDOR_SETTLE_S
+        xm.VENDOR_SETTLE_S = 0
+        try:
+            r = xm.read_battery([iface], listen_seconds=0.01)
+        finally:
+            xm.VENDOR_SETTLE_S = old
+        self.assertTrue(r.found)
+        self.assertFalse(r.ok)
+        self.assertIn("未公开电量协议", r.detail)
+
     def test_no_standard_fields(self):
         ifs = [FakeIface(path(0x2717, 0x5091, 0), 0x2717, 0x5091, 0x0001, 0x0002),
                FakeIface(path(0x2717, 0x5091, 1), 0x2717, 0x5091, 0xFF00, 0x0001, feature_len=8)]
