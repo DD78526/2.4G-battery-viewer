@@ -244,9 +244,9 @@ class TrayApp:
     def _color(level: Optional[int]) -> tuple[int, int, int]:
         if level is None:
             return (150, 155, 160)
-        if level >= 60:
+        if level >= 40:
             return (93, 220, 138)
-        if level >= 30:
+        if level >= 11:
             return (245, 196, 81)
         return (255, 107, 107)
 
