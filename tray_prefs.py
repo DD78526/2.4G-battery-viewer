@@ -61,3 +61,21 @@ def visible_icon_entries(icons: list, levels: dict) -> list:
     levels: {key: (level, note, found)}
     """
     return [t for t in icons if levels.get(t[1], (None, "", False))[2]]
+
+
+# 托盘 open_ui：防连点重复拉起面板（秒）
+UI_LAUNCH_DEBOUNCE_SEC = 8.0
+
+
+def should_spawn_ui(existing_hwnd: bool, launch_ts: float, now: float,
+                    debounce: float = UI_LAUNCH_DEBOUNCE_SEC) -> bool:
+    """是否该再 Popen 一个 BatteryViewer。
+
+    已有窗口 → 否；刚启动过、窗口标题还没挂上 → 否（等现有进程）。
+    """
+    if existing_hwnd:
+        return False
+    if launch_ts and (now - launch_ts) < debounce:
+        return False
+    return True
+

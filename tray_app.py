@@ -6,7 +6,7 @@
 * 通知区域最多三个图标：小米鼠标（纯数字）、雷蛇耳机 / 赛睿耳机（数字带深色底板）。
   没插接收器的那一类不显示图标（三类都没插时全部显示 "--"，免得托盘里什么都看不到）。
   图标颜色随电量变化：绿 ≥60 / 黄 30-59 / 红 <30。
-* **右键图标 → 菜单**（打开界面 / 立即刷新 / 退出）。
+* **右键图标 → 菜单**（打开界面 / 立即刷新 / 关闭程式）。
 * **双击图标 → 打开/恢复简洁界面**。
 * 左键单击 → 立刻刷新一次。
 * 悬停 tooltip：开启「托盘显示电量%」时以设备名为主（可带电量）。
@@ -223,6 +223,7 @@ class TrayApp:
         self.levels = {k: (None, "正在读取…", True) for _, k, _, _ in TRAY_ICONS}
         self.icons_added = False
         self.shown: set[int] = set()
+        self._ui_launch_ts: float = 0.0  # 防双击连开多个面板
         self.taskbar_created_msg = USER32.RegisterWindowMessageW("TaskbarCreated")
         self.msg_quit = USER32.RegisterWindowMessageW(tc.MSG_QUIT)
         self.msg_reload = USER32.RegisterWindowMessageW(tc.MSG_RELOAD)
@@ -368,14 +369,19 @@ class TrayApp:
 
     # ---- 打开简洁界面 ---------------------------------------------------
     def open_ui(self, minimized: bool = False) -> None:
+        """打开或恢复唯一的简洁界面；绝不并行再起一个 BatteryViewer。"""
         hwnd = tc.ui_hwnd()
         if hwnd:
+            self._ui_launch_ts = 0.0
             if minimized:
                 USER32.ShowWindow(hwnd, 0)          # SW_HIDE
             else:
-                USER32.ShowWindow(hwnd, SW_RESTORE)
-                USER32.SetForegroundWindow(hwnd)
+                tc.focus_or_show_ui()
             self.log("简洁界面已在前台" if not minimized else "简洁界面保持隐藏")
+            return
+        # 窗口标题尚未挂上时，避免连点再 spawn
+        if not prefs.should_spawn_ui(False, self._ui_launch_ts, time.time()):
+            self.log("简洁界面正在启动，跳过重复打开")
             return
         import subprocess
         try:
@@ -386,12 +392,14 @@ class TrayApp:
             if minimized:
                 cmd = list(cmd) + ["--minimized"]
             subprocess.Popen(cmd, cwd=BASE_DIR, creationflags=0x00000008)
+            self._ui_launch_ts = time.time()
             self.log("已打开简洁界面" + ("（最小化）" if minimized else ""))
         except Exception as e:
+            self._ui_launch_ts = 0.0
             self.log(f"打开界面失败：{e}")
 
     def show_menu(self) -> None:
-        """右键菜单：打开界面 / 刷新 / 退出（真正退出，不是藏到托盘）。"""
+        """右键菜单：打开界面 / 刷新 / 关闭程式（真正退出，不是藏到托盘）。"""
         menu = USER32.CreatePopupMenu()
         if not menu:
             return
@@ -399,7 +407,7 @@ class TrayApp:
             USER32.AppendMenuW(menu, MF_STRING, IDM_OPEN, "打开界面")
             USER32.AppendMenuW(menu, MF_STRING, IDM_REFRESH, "立即刷新")
             USER32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-            USER32.AppendMenuW(menu, MF_STRING, IDM_QUIT, "退出")
+            USER32.AppendMenuW(menu, MF_STRING, IDM_QUIT, "关闭程式")
             pt = POINT()
             USER32.GetCursorPos(ctypes.byref(pt))
             # 让菜单能正确收回：先置前台再 TrackPopupMenu
@@ -427,7 +435,7 @@ class TrayApp:
         self.log("已强制关闭简洁界面")
 
     def quit_all(self) -> None:
-        """托盘菜单「退出」：界面 + 托盘都真正退出。"""
+        """托盘菜单「关闭程式」：界面 + 托盘都真正退出。"""
         self.quit_ui()
         self.quit()
 
@@ -462,7 +470,7 @@ class TrayApp:
             self.refresh_now()
             return 0
         if msg == self.msg_quit:
-            self.quit()
+            self.quit_all()
             return 0
         if msg == self.msg_reload:
             self.apply_config()
@@ -540,7 +548,7 @@ def main() -> int:
         if tc.is_tray_running():
             # 真有一个正常实例在跑：让它重读配置
             tc.post_to_tray(tc.MSG_RELOAD)
-            print("已经在运行了（托盘图标就是它；双击打开界面，右键可退出）")
+            print("已经在运行了（托盘图标就是它；双击打开界面，右键可关闭程式）")
             return 0
         # 有人占着锁但已经没有窗口 —— 上一版留下的僵尸进程，清掉后继续启动
         tc.cleanup_zombie()

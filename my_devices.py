@@ -400,7 +400,7 @@ def build_ui():
                     results.put(("tray", ok))
 
                 threading.Thread(target=work, daemon=True).start()
-            notify("关闭窗口将最小化到托盘；请在托盘右键菜单选「退出」真正退出", 12)
+            notify("关闭窗口将最小化到托盘；请在托盘右键菜单选「关闭程式」真正退出", 12)
         else:
             notify("关闭窗口将退出程序")
 
@@ -507,7 +507,7 @@ def build_ui():
                 root.withdraw()
             except Exception:
                 pass
-            notify("已最小化到托盘（右键托盘图标 → 退出 可真正退出）", 10)
+            notify("已最小化到托盘（右键托盘图标 → 关闭程式 可真正退出）", 10)
             return
         try:
             root.destroy()
@@ -564,6 +564,16 @@ def main() -> None:
     if args.once:
         cli_once(args.verbose)
         return
+
+    # 面板单实例：已打开则恢复/置前台，绝不第二窗口
+    ok, _ui_mutex = tc.claim_ui_single_instance()
+    if not ok:
+        if tc.activate_existing_ui():
+            print("简洁界面已在运行，已切换到前台")
+        else:
+            print("简洁界面似乎已在运行（未能定位窗口）")
+        return
+
     try:
         root = build_ui()
     except Exception:

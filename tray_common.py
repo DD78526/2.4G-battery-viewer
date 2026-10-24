@@ -42,6 +42,7 @@ PANEL_EXE_NAME = "BatteryViewer.exe"
 APP_NAME = "DeviceBatteryTray"
 WND_CLASS = "DeviceBatteryTrayWnd"
 MUTEX_NAME = "Global\\DeviceBatteryTray_single_instance"
+UI_MUTEX_NAME = "Global\\DeviceBatteryViewer_single_instance"
 
 # 界面标题（托盘用它来找到已打开的窗口）
 UI_TITLE = "我的设备电量"
@@ -67,6 +68,22 @@ USER32.ShowWindow.restype = wintypes.BOOL
 USER32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
 USER32.SetForegroundWindow.restype = wintypes.BOOL
 USER32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+USER32.IsIconic.restype = wintypes.BOOL
+USER32.IsIconic.argtypes = [ctypes.c_void_p]
+USER32.IsWindowVisible.restype = wintypes.BOOL
+USER32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+
+SW_HIDE = 0
+SW_SHOW = 5
+SW_RESTORE = 9
+SW_SHOWNA = 8
+
+ERROR_ALREADY_EXISTS = 183
+
+KERNEL32.CreateMutexW.restype = ctypes.c_void_p
+KERNEL32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+KERNEL32.CloseHandle.restype = wintypes.BOOL
+KERNEL32.CloseHandle.argtypes = [ctypes.c_void_p]
 
 
 # --------------------------------------------------------------------------
@@ -350,6 +367,39 @@ def post_to_tray(msg_name: str) -> bool:
 def ui_hwnd() -> int:
     h = USER32.FindWindowW(None, UI_TITLE)
     return int(h) if h else 0
+
+
+def focus_or_show_ui() -> bool:
+    """若简洁界面已在跑：显示（含藏到托盘的）并置前台。成功返回 True。"""
+    hwnd = ui_hwnd()
+    if not hwnd:
+        return False
+    if USER32.IsIconic(hwnd) or not USER32.IsWindowVisible(hwnd):
+        USER32.ShowWindow(hwnd, SW_RESTORE)
+    else:
+        USER32.ShowWindow(hwnd, SW_SHOW)
+    USER32.SetForegroundWindow(hwnd)
+    return True
+
+
+def claim_ui_single_instance() -> tuple[bool, object]:
+    """面板进程单实例锁。
+
+    返回 (ok, handle)：
+      ok=True  → 本进程是唯一实例，调用方须保持 handle 存活到退出
+      ok=False → 已有实例，handle 可为 None；调用方应 focus 后退出
+    """
+    handle = KERNEL32.CreateMutexW(None, False, UI_MUTEX_NAME)
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        if handle:
+            KERNEL32.CloseHandle(handle)
+        return False, None
+    return True, handle
+
+
+def activate_existing_ui() -> bool:
+    """第二实例启动时：把已有面板拉到前台（含 withdraw 隐藏态）。"""
+    return focus_or_show_ui()
 
 
 def start_tray_app(wait_timeout: float = 6.0) -> bool:
