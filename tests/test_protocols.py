@@ -387,58 +387,102 @@ class TestXiaomi(Base):
     def test_checksum65_and_request_layout(self):
         req = xm.build_battery_request(product_type=2, param=0)
         self.assertEqual(len(req), 65)
-        self.assertEqual(list(req[:9]), [0x00, 0x00, 0x03, 0x81, 0x03, 0x02, 0x00, 0x00, 0x01])
+        # opcode 0x8108 LE + len=0x01 + product_type=2
+        self.assertEqual(list(req[:9]), [0x00, 0x00, 0x08, 0x81, 0x01, 0x02, 0x00, 0x00, 0x00])
         s = sum(req[0:63]) & 0xFFFF
         self.assertEqual(req[63], s & 0xFF)
         self.assertEqual(req[64], (s >> 8) & 0xFF)
-        # 与真机确认脚本同一帧
         self.assertEqual(req.hex(), xm.build_battery_request(2, 0).hex())
 
     def test_parse_battery_response(self):
-        ok = bytes([0x00, 0x01, 0x03, 0x81, 0x03, 0x02, 0x00, 0x00, 0x01, 0x42]) + bytes(55)
-        self.assertEqual(xm.parse_battery_response(ok), 66)
-        nak = bytes([0x00, 0x03, 0x03, 0x81, 0x03, 0x02, 0x00, 0x00, 0x01, 0x42]) + bytes(55)
-        self.assertIsNone(xm.parse_battery_response(nak))
+        # 电量在 [7]；要求 status=01 且 opcode 回显 08 81
+        ok = bytearray(65)
+        ok[1], ok[2], ok[3], ok[7] = 0x01, 0x08, 0x81, 55
+        self.assertEqual(xm.parse_battery_response(bytes(ok)), 55)
+        nak = bytearray(ok); nak[1] = 0x03
+        self.assertIsNone(xm.parse_battery_response(bytes(nak)))
+        wrong_op = bytearray(ok); wrong_op[2], wrong_op[3] = 0x03, 0x81  # 旧 0x8103
+        self.assertIsNone(xm.parse_battery_response(bytes(wrong_op)))
         self.assertIsNone(xm.parse_battery_response(b""))
-        self.assertEqual(xm.parse_battery_response(
-            bytes([0x00, 0x01]) + bytes(7) + bytes([0xFF]) + bytes(55)), 100)
+        clamp = bytearray(65)
+        clamp[1], clamp[2], clamp[3], clamp[7] = 0x01, 0x08, 0x81, 0xFF
+        self.assertEqual(xm.parse_battery_response(bytes(clamp)), 100)
 
     def test_vendor_feature_x1_success(self):
         iface = FakeIface(path(0x2717, 0x50A5, 2), 0x2717, 0x50A5,
                           0xFFFF, 0x0001, feature_len=65)
 
         def responder(frame: bytes) -> bytes:
-            self.assertEqual(frame[3:6], bytes([0x81, 0x03, 0x02]))
+            self.assertEqual(list(frame[2:6]), [0x08, 0x81, 0x01, 0x02])
             out = bytearray(65)
-            out[0:9] = bytes([0x00, 0x01, 0x03, 0x81, 0x03, 0x02, 0x00, 0x00, 0x01])
-            out[9] = 73
+            out[1], out[2], out[3], out[5], out[7] = 0x01, 0x08, 0x81, 0x02, 73
             return bytes(out)
 
         FakeDevice.feature_responder = staticmethod(responder)
-        # 单测里不要真 sleep
-        old = xm.VENDOR_SETTLE_S
-        xm.VENDOR_SETTLE_S = 0
+        old_s, old_g = xm.VENDOR_SETTLE_S, xm.VENDOR_GET_GAP_S
+        xm.VENDOR_SETTLE_S = xm.VENDOR_GET_GAP_S = 0
         try:
             r = xm.read_battery([iface], listen_seconds=0.01)
         finally:
-            xm.VENDOR_SETTLE_S = old
+            xm.VENDOR_SETTLE_S, xm.VENDOR_GET_GAP_S = old_s, old_g
         self.assertTrue(r.ok)
         self.assertEqual(r.level, 73)
         self.assertEqual(r.model, "小米鼠标 X1")
-        self.assertIn("0x8103", r.detail)
-        self.assertTrue(any("vendor 0x8103" in d for d in r.diag))
+        self.assertIn("0x8108", r.detail)
+        self.assertTrue(any("vendor 0x8108" in d for d in r.diag))
+
+    def test_vendor_skips_ghub_pollution(self):
+        """G-HUB 粘滞帧（非 08 81）应被跳过，直到读到本 opcode 回显。"""
+        iface = FakeIface(path(0x2717, 0x50A5, 2), 0x2717, 0x50A5,
+                          0xFFFF, 0x0001, feature_len=65)
+        seen_req = []
+
+        class SeqDev(FakeDevice):
+            def __init__(self, path, write=False):
+                super().__init__(path, write)
+                self._gets = 0
+
+            def set_feature_report(self, data: bytes):
+                FakeDevice.writes.append(bytes(data))
+                seen_req.append(list(data[2:6]))
+
+            def get_feature_report(self, report_id: int, length=None):
+                self._gets += 1
+                out = bytearray(65)
+                if self._gets == 1:
+                    # G-HUB 8704 粘滞
+                    out[1], out[2], out[3] = 0x01, 0x04, 0x87
+                    out[7] = 1
+                else:
+                    out[1], out[2], out[3], out[7] = 0x01, 0x08, 0x81, 55
+                return bytes(out)
+
+        import hid_win as hw
+        old_cls = hw.HidDevice
+        hw.HidDevice = SeqDev
+        old_s, old_g = xm.VENDOR_SETTLE_S, xm.VENDOR_GET_GAP_S
+        xm.VENDOR_SETTLE_S = xm.VENDOR_GET_GAP_S = 0
+        try:
+            r = xm.read_battery([iface], listen_seconds=0.01)
+        finally:
+            xm.VENDOR_SETTLE_S, xm.VENDOR_GET_GAP_S = old_s, old_g
+            hw.HidDevice = old_cls
+        self.assertGreaterEqual(len(seen_req), 1)
+        self.assertTrue(all(r == [0x08, 0x81, 0x01, 0x02] for r in seen_req))
+        self.assertTrue(r.ok)
+        self.assertEqual(r.level, 55)
 
     def test_vendor_nak_falls_through(self):
         iface = FakeIface(path(0x2717, 0x50A5, 2), 0x2717, 0x50A5,
                           0xFFFF, 0x0001, feature_len=65)
         FakeDevice.feature_responder = staticmethod(
             lambda frame: bytes([0x00, 0x03]) + bytes(63))
-        old = xm.VENDOR_SETTLE_S
-        xm.VENDOR_SETTLE_S = 0
+        old_s, old_g = xm.VENDOR_SETTLE_S, xm.VENDOR_GET_GAP_S
+        xm.VENDOR_SETTLE_S = xm.VENDOR_GET_GAP_S = 0
         try:
             r = xm.read_battery([iface], listen_seconds=0.01)
         finally:
-            xm.VENDOR_SETTLE_S = old
+            xm.VENDOR_SETTLE_S, xm.VENDOR_GET_GAP_S = old_s, old_g
         self.assertTrue(r.found)
         self.assertFalse(r.ok)
         self.assertIn("未公开电量协议", r.detail)

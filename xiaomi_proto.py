@@ -3,18 +3,18 @@
 
 协议来源（真机 + 官方 DLL 反汇编，不是猜的）：
   [DLL]  XiaoMiMouseLibrary.dll（随「小米键鼠」/ Xiaomi G-HUB 安装，PE32）
-         导出 XIAOMIMOUSE_GetBatteryLevel；电池辅助函数约 0x1000a110
-         Feature 请求 opcode 字 0x8103（大端写到 [3]=81 [4]=03，见 build_battery_request）
+         消息 cmd 0x47 → 辅助函数约 0x100044b0
+         Feature 请求 opcode 字 0x8108（LE 写到 [2]=08 [3]=81），[4]=0x01
          product_type==2 时 byte[5]=0x02（Mouse X1 / 50A5·50A6 实测）
          校验：sum(bytes[0..62]) → [63]=lo [64]=hi（DLL 约 0x10002030）
-         成功：回复 [1]==0x01，电量在 [9]（0..100）
-         [1]==0x03 为 NAK/粘滞 echo，不当作电量
-  [LIVE] 本仓库在 Windows 真机 2717:50A5（产品串 XiaoMi Mouse X1，嵌套 50A6）
+         成功：回复 [1]==0x01 且 [2:4] 回显 08 81；电量在 [7]（0..100）
+         （旧实现误用 cmd 0x6b / opcode 0x8103，把 [9] 当电量，读到的是 flag=1）
+  [LIVE] 本仓库在 Windows 真机 2717:50A5（产品串 XiaoMi Mouse X1）
          MI_02 / UsagePage 0xFFFF Usage 0x0001 / FeatureReportByteLength=65
-         连续 8 次读到 status=01 level=01（近空电，稳定）
+         与官方软件同屏：官方约 55% 时，0x8108 连续读 [7]=55
 
 公开资料仍然没有完整协议文档（libratbag #1800、hid-xiaomi.c 都不覆盖电量），
-所以未知型号不会瞎编其它 opcode；只对匹配的 65 字节 vendor Feature 口发 0x8103。
+所以未知型号不会瞎编其它 opcode；只对匹配的 65 字节 vendor Feature 口发 0x8108。
 
 仍保留两条有依据的兜底：
   1. 标准 HID 电量字段（Usage 0x06/0x20、0x85/0x01|0x66|0x65）——不用 0x06/0x29 信号强度
@@ -34,8 +34,16 @@ VID = 0x2717
 VENDOR_USAGE_PAGE = 0xFFFF
 VENDOR_USAGE = 0x0001
 VENDOR_FEATURE_LEN = 65
-VENDOR_OPCODE = 0x8103          # BE 落在请求 [3]=0x81 [4]=0x03
+VENDOR_OPCODE = 0x8108          # LE 落在请求 [2]=0x08 [3]=0x81
+VENDOR_OPCODE_LO = VENDOR_OPCODE & 0xFF          # 0x08
+VENDOR_OPCODE_HI = (VENDOR_OPCODE >> 8) & 0xFF   # 0x81
+VENDOR_LEN_BYTE = 0x01          # DLL mov byte ptr [ebp-0x44], 1
 VENDOR_SETTLE_S = 0.08
+# G-HUB 会并发写 Feature 缓冲（8704/8404…）；多读几次直到回显本 opcode；
+# 污染时重新 SetFeature，避免粘滞帧占满整轮重试。
+VENDOR_GET_ATTEMPTS = 12
+VENDOR_GET_GAP_S = 0.05
+VENDOR_RESET_ON_POLLUTION = True
 
 KNOWN_MODELS = {
     0x5091: "小米 USB 接收器（Mi USB Receiver）",
@@ -86,7 +94,7 @@ def match_usage(cap) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 官方 DLL 反汇编得到的 0x8103 Feature 协议（纯函数，方便单测）
+# 官方 DLL 反汇编得到的 0x8108 Feature 协议（纯函数，方便单测）
 # ---------------------------------------------------------------------------
 def checksum65(buf: bytearray) -> None:
     """原地写入 [63]=sum(lo) [64]=sum(hi)；与 XiaoMiMouseLibrary.dll 一致。"""
@@ -96,32 +104,38 @@ def checksum65(buf: bytearray) -> None:
 
 
 def build_battery_request(product_type: int = 2, param: int = 0) -> bytes:
-    """构造 65 字节 GetBatteryLevel Feature 请求。
+    """构造 65 字节 GetBatteryLevel Feature 请求（cmd 0x47 / opcode 0x8108）。
 
-    布局（与 DLL / 真机确认脚本一致）：
-      [0]=00 report id  [1]=00  [2]=03
-      [3]=81 [4]=03     ← opcode 0x8103 大端写到 [3],[4]（真机帧 00 00 03 81 03 02 …）
-      [5]=product_type  [6]=00  [7]=param  [8]=01
+    布局（与 DLL 0x100044b0 / 真机确认一致）：
+      [0]=00 report id  [1]=00
+      [2]=08 [3]=81     ← opcode 0x8108 小端字
+      [4]=01            ← 长度字节（DLL 写 1）
+      [5]=product_type  [6]=00  [7]=param  [8]=00
       [9..62]=00        [63..64]=checksum
     """
     b = bytearray(VENDOR_FEATURE_LEN)
-    b[2] = 0x03
-    b[3] = (VENDOR_OPCODE >> 8) & 0xFF   # 0x81
-    b[4] = VENDOR_OPCODE & 0xFF          # 0x03
+    b[2] = VENDOR_OPCODE_LO
+    b[3] = VENDOR_OPCODE_HI
+    b[4] = VENDOR_LEN_BYTE
     b[5] = product_type & 0xFF
     b[7] = param & 0xFF
-    b[8] = 0x01
     checksum65(b)
     return bytes(b)
 
 
 def parse_battery_response(resp: bytes) -> Optional[int]:
-    """成功返回 0..100；status!=0x01 或长度不够返回 None。"""
-    if not resp or len(resp) < 10:
+    """成功返回 0..100；status!=0x01、非本 opcode 回显或长度不够返回 None。
+
+    电量在 [7]（DLL 把 out[6]=resp[7] 写入 msg+0xC；真机与官方 UI 同屏验证）。
+    """
+    if not resp or len(resp) < 8:
         return None
     if resp[1] != 0x01:
         return None
-    return max(0, min(100, int(resp[9])))
+    # 要求回显 0x8108，避免把 G-HUB 的 8704/8404 粘滞帧当成电量
+    if resp[2] != VENDOR_OPCODE_LO or resp[3] != VENDOR_OPCODE_HI:
+        return None
+    return max(0, min(100, int(resp[7])))
 
 
 def product_types_for(pid: int) -> list[int]:
@@ -145,7 +159,7 @@ def _is_vendor_iface(iface) -> bool:
 
 
 def _vendor_battery(iface, diag: list, product_types: list[int]) -> Optional[DeviceBattery]:
-    """在 MI_02 65 字节 Feature 口上发 0x8103，读电量。"""
+    """在 MI_02 65 字节 Feature 口上发 0x8108，读电量。"""
     if not _is_vendor_iface(iface):
         return None
     from hid_win import HidDevice
@@ -160,24 +174,44 @@ def _vendor_battery(iface, diag: list, product_types: list[int]) -> Optional[Dev
                 diag.append(f"  vendor SET pt={pt} 失败：{e}")
                 continue
             time.sleep(VENDOR_SETTLE_S)
-            try:
-                resp = dev.get_feature_report(0x00, VENDOR_FEATURE_LEN)
-            except OSError as e:
-                diag.append(f"  vendor GET pt={pt} 失败：{e}")
-                continue
-            if not resp:
-                continue
-            last_status = resp[1] if len(resp) > 1 else None
-            level = parse_battery_response(resp)
+            level = None
+            level_byte = None
+            for attempt in range(VENDOR_GET_ATTEMPTS):
+                try:
+                    resp = dev.get_feature_report(0x00, VENDOR_FEATURE_LEN)
+                except OSError as e:
+                    diag.append(f"  vendor GET pt={pt} 失败：{e}")
+                    break
+                if not resp:
+                    continue
+                last_status = resp[1] if len(resp) > 1 else None
+                level_byte = resp[7] if len(resp) > 7 else None
+                level = parse_battery_response(resp)
+                if level is not None:
+                    break
+                # 污染帧（status 看似 ok 但 opcode 不是 08 81）→ 重新下发请求
+                polluted = (
+                    VENDOR_RESET_ON_POLLUTION
+                    and len(resp) >= 4
+                    and (resp[2] != VENDOR_OPCODE_LO or resp[3] != VENDOR_OPCODE_HI)
+                )
+                if polluted:
+                    try:
+                        dev.set_feature_report(req)
+                    except OSError:
+                        pass
+                    time.sleep(VENDOR_SETTLE_S)
+                elif attempt + 1 < VENDOR_GET_ATTEMPTS and VENDOR_GET_GAP_S:
+                    time.sleep(VENDOR_GET_GAP_S)
             diag.append(
-                f"  vendor 0x8103 pt={pt} status=0x{(last_status or 0):02X} "
-                f"level_byte={resp[9] if len(resp) > 9 else '-'} "
+                f"  vendor 0x8108 pt={pt} status=0x{(last_status or 0):02X} "
+                f"level_byte={level_byte if level_byte is not None else '-'} "
                 f"({'ok' if level is not None else 'nak'})"
             )
             if level is not None:
                 return DeviceBattery(
                     found=True, online=True, level=level, charging=None,
-                    detail=f"小米官方协议 0x8103（product_type={pt}）",
+                    detail=f"小米官方协议 0x8108（product_type={pt}）",
                 )
     if last_status == 0x03:
         diag.append("  vendor 口返回 sticky NAK(0x03)，鼠标可能离线或 product_type 不对")
@@ -261,7 +295,7 @@ def read_battery(all_ifaces: Optional[list] = None, listen_seconds: float = 1.5)
     errors = []
     pts = product_types_for(pid)
 
-    # 1) 官方 0x8103（优先，X1 真机验证）
+    # 1) 官方 0x8108（优先，X1 真机 + 官方 UI 同屏验证）
     for iface in mine:
         try:
             res = _vendor_battery(iface, diag, pts)
